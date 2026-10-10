@@ -1,7 +1,0 @@
-﻿participant_id,consent,group,condition,set_key,seconds,confidence_before,confidence_after,would_use,note
-S01,yes,AB,COND1_NO_SYSTEM,A,980,3,2,maybe,SAMPLE - du lieugia dinh
-S01,yes,AB,COND2_WITH_SYSTEM,B,610,4,4,yes,SAMPLE - du lieugia dinh
-S02,yes,BA,COND1_NO_SYSTEM,B,1240,3,2,maybe,SAMPLE - du lieugia dinh
-S02,yes,BA,COND2_WITH_SYSTEM,A,720,4,4,yes,SAMPLE - du lieugia dinh
-S03,yes,AB,COND1_NO_SYSTEM,A,860,3,2,maybe,SAMPLE - du lieugia dinh
-S03,yes,AB,COND2_WITH_SYSTEM,B,540,4,4,yes,SAMPLE - du lieugia dinh

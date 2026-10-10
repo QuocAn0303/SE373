@@ -1,5 +1,0 @@
-﻿participant_id,consent,group,condition,set_key,seconds,confidence_before,confidence_after,would_use,note
-P01,yes,AB,COND1_NO_SYSTEM,A,,3,2,maybe,
-P01,yes,AB,COND2_WITH_SYSTEM,B,,4,4,yes,
-P02,yes,BA,COND1_NO_SYSTEM,B,,2,2,maybe,
-P02,yes,BA,COND2_WITH_SYSTEM,A,,4,4,yes,

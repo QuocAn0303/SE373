@@ -328,9 +328,16 @@ model User {
   crmLeadsOwned           CrmLead[]        @relation("CrmLeadOwner")
   crmDealsOwned           CrmDeal[]        @relation("CrmDealOwner")
   crmCommunications       CrmCommunication[]
+  chatBindings            ChatBinding[]
+
+  // HERMES Phase 5 — binding phòng ban trực tiếp (song song Employee.departmentId
+  // để user chưa có hồ sơ Employee vẫn bị giới hạn dept). NULL = chưa xếp phòng.
+  departmentId String?
+  department   Department? @relation("UserDepartment", fields: [departmentId], references: [id], onDelete: SetNull)
 
   @@index([tenantId])
   @@index([tenantId, reportsToId])
+  @@index([departmentId])
   @@map("users")
 }
 
@@ -3250,9 +3257,18 @@ model ReportSchedule {
   nextRunAt DateTime?
   isActive  Boolean     @default(true)
   createdAt DateTime    @default(now())
+  // HERMES Phase 6 — NL-schedule: kênh gửi + chat đích + template tóm tắt LLM.
+  // channel: EMAIL | TELEGRAM | BOTH. telegramChatId: chat/group nhận báo cáo.
+  // template: mẫu tóm tắt (vd "weekly_pnl"). nlQuery: câu chat gốc tạo lịch.
+  channel        String   @default("EMAIL")
+  telegramChatId String?
+  template       String?
+  nlQuery        String?  @db.Text
+  createdById    String?
 
   @@map("report_schedules")
 @@index([tenantId])
+  @@index([isActive, nextRunAt])
 }
 
 // ==================== PHASE 4: WORKFLOW ENGINE ====================
@@ -4083,6 +4099,7 @@ model Department {
   id          String   @id @default(uuid())
   tenantId    String?
   name        String
+  code        String?  // SALES | MARKETING | HR | ACCOUNTING | CSKH | OPS
   description String?
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
@@ -4090,7 +4107,12 @@ model Department {
 
   employees   Employee[]
   documents   InternalDocumentDepartment[]
+  users       User[]   @relation("UserDepartment")
+  memories    AgentMemory[]
+  skills      AgentSkill[]
+  budgets     DeptBudget[]
 
+  @@unique([tenantId, code])
   @@map("departments")
 @@index([tenantId])
 }
@@ -4125,6 +4147,124 @@ model InternalDocumentDepartment {
 
   @@unique([documentId, departmentId])
   @@map("internal_document_departments")
+}
+
+// ==================== HERMES AGENT OPS (2026-10) ====================
+// Trợ lý vận hành kiểu Hermes: Telegram ChatOps + orchestrator + 6 agent phòng
+// ban + memory + skill registry + dept budget. Mọi write/spend đi qua
+// AgentHumanGate (không cơ chế duyệt thứ hai).
+
+// Phase 1 — binding Telegram ↔ User (OTP trong app → nhắn bot).
+model ChatBinding {
+  id             String   @id @default(uuid())
+  tenantId       String?
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider       String   @default("TELEGRAM") // TELEGRAM (sau này: SLACK/DISCORD)
+  externalUserId String   // telegramUserId (chat.id người nhắn)
+  chatId         String?  // chat đích nhận reply (riêng/tư hoặc group)
+  otpCode        String?  // OTP chờ xác thực (null sau khi đã bind)
+  otpExpiresAt   DateTime?
+  isActive       Boolean  @default(true)
+  lastUpdateId   String?  // update_id Telegram cuối đã xử lý (idempotency)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([provider, externalUserId])
+  @@unique([tenantId, userId, provider])
+  @@index([otpCode])
+  @@map("chat_bindings")
+  @@index([tenantId])
+}
+
+// Phase 3 — Bộ nhớ sự thật công ty đa phiên, đa user.
+// scope COMPANY: mọi phòng thấy. scope DEPT: chỉ phòng đó (qua departmentId).
+// status PENDING: fact ứng viên chờ duyệt (không recall). ACTIVE mới được nạp
+// vào system prompt. RETIRED: fact cũ bị thay thế.
+enum AgentMemoryStatus {
+  PENDING
+  ACTIVE
+  RETIRED
+}
+
+enum AgentMemoryScope {
+  COMPANY
+  DEPT
+}
+
+model AgentMemory {
+  id              String            @id @default(uuid())
+  tenantId        String?
+  scope           AgentMemoryScope  @default(COMPANY)
+  departmentId    String?
+  department      Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  key             String            // vd "preferred_vendor", "closing_supplier"
+  fact            String            @db.Text
+  sourceSessionId String?
+  status          AgentMemoryStatus @default(PENDING)
+  createdById     String?
+  decidedById     String?
+  decidedAt       DateTime?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  @@index([tenantId, status, scope])
+  @@index([tenantId, departmentId, status])
+  @@map("agent_memories")
+}
+
+// Phase 4 — Skill registry: năng lực agent tự đề xuất, người duyệt, sandbox trước live.
+// status DRAFT: agent tạo, chưa ai duyệt (orchestrator KHÔNG gọi).
+// PENDING: chờ MANAGER duyệt. APPROVED: được gọi nếu đúng deptScope. DISABLED: thu hồi ngay.
+enum AgentSkillStatus {
+  DRAFT
+  PENDING
+  APPROVED
+  DISABLED
+}
+
+model AgentSkill {
+  id              String           @id @default(uuid())
+  tenantId        String?
+  code            String           // vd "debt_summary_8am"
+  version         Int              @default(1)
+  name            String
+  description     String?          @db.Text
+  departmentScope String?          // dept code (SALES/HR/...) hoặc null = mọi phòng
+  departmentId    String?
+  department      Department?      @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  handlerRef      String?          // tên handler trong HANDLERS / service path
+  status          AgentSkillStatus @default(DRAFT)
+  testReport      Json?            // kết quả chạy sandbox (DB rollback)
+  examples        Json?            // ví dụ input/output khi propose
+  createdById     String?
+  decidedById     String?
+  decidedAt       DateTime?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@unique([tenantId, code, version])
+  @@index([tenantId, status])
+  @@map("agent_skills")
+}
+
+// Phase 5 — Ngân sách chi tiêu theo phòng ban theo tháng.
+// spent cộng dồn khi gate spend APPROVED + executed. Vượt envelope → auto-escalate.
+model DeptBudget {
+  id           String     @id @default(uuid())
+  tenantId     String?
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id], onDelete: Cascade)
+  month        Int        // 1-12
+  year         Int
+  limit        Decimal    @db.Decimal(15, 2)
+  spent        Decimal    @default(0) @db.Decimal(15, 2)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  @@unique([tenantId, departmentId, month, year])
+  @@index([tenantId, month, year])
+  @@map("dept_budgets")
 }
 
 model AiDocument {

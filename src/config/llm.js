@@ -35,20 +35,37 @@ const { getTenantId } = require("./tenantContext");
 const DEFAULT_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 
 const config = () => {
-  const key = process.env.GEMINI_API_KEY || "";
+  // HERMES Phase 0 — LLM UIT qua gateway OpenAI-compatible:
+  //   LLM_PROVIDER=openai-compatible
+  //   LLM_BASE_URL=https://llm.uit.edu.vn/gemma/v1 (+ LLM_API_KEY)
+  //   LLM_MODEL=gemma-4-26b
+  //   LLM_REASONING_BASE_URL=https://llm.uit.edu.vn/qwen/v1 (Qwen thinking)
+  //   LLM_REASONING_MODEL=qwen3.8-27b
+  // Ngoài mạng trường/VPN → fallback Gemini cloud free (LLM_PROVIDER=gemini).
+  const key = process.env.LLM_API_KEY || process.env.GEMINI_API_KEY || "";
   const provider = (process.env.LLM_PROVIDER || (key ? "gemini" : "local")).toLowerCase();
   return {
     provider,
     apiKey: key,
     model: process.env.LLM_MODEL || "gemini-3.8-flash",
     baseUrl: (process.env.LLM_BASE_URL || DEFAULT_GEMINI_BASE).replace(/\/$/, ""),
+    reasoningBaseUrl: (process.env.LLM_REASONING_BASE_URL || "").replace(/\/$/, ""),
+    reasoningModel: process.env.LLM_REASONING_MODEL || "",
+    reasoningKey: process.env.LLM_REASONING_API_KEY || key,
     timeoutMs: Number(process.env.LLM_TIMEOUT_MS) || 60000,
   };
 };
 
 const isConfigured = () => {
   const c = config();
-  return c.provider !== "local" && Boolean(c.apiKey);
+  return c.provider !== "local" && Boolean(c.apiKey || c.provider === "openai-compatible");
+};
+
+/** Cấu hình model suy luận (Qwen thinking). Null khi chưa cấu hình. */
+const reasoningConfig = () => {
+  const c = config();
+  if (!c.reasoningBaseUrl || !c.reasoningModel) return null;
+  return { baseUrl: c.reasoningBaseUrl, model: c.reasoningModel, apiKey: c.reasoningKey };
 };
 
 const describe = () => {
@@ -204,8 +221,84 @@ const recordUsage = async ({ task, provider, model, mode, usage, latencyMs, succ
   }
 };
 
-const callModel = async (model, { system, prompt, jsonMode, temperature, maxOutputTokens }) => {
+/**
+ * Gọi gateway OpenAI-compatible (llm.uit.edu.vn/gemma|qwen/v1).
+ * Tách reasoning_content khỏi content ở tầng parse (Qwen bật thinking trả cả hai).
+ * Trả về { text, reasoning, usage } — reasoning giữ lại để log/debug, KHÔNG
+ * đưa vào reply cho user.
+ */
+const callOpenAICompatible = async ({ baseUrl, apiKey, model, system, prompt, jsonMode, temperature, maxOutputTokens }) => {
+  const httpMod = String(baseUrl).startsWith('http://') ? require('http') : require('https');
+  const target = new URL(`${baseUrl.replace(/\/$/, '')}/chat/completions`);
+  const messages = [
+    ...(system ? [{ role: 'system', content: system }] : []),
+    { role: 'user', content: prompt },
+  ];
+  const payload = JSON.stringify({
+    model,
+    messages,
+    temperature,
+    max_tokens: Math.max(maxOutputTokens || 2048, 2000),
+    ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
+  });
+  const json = await new Promise((resolve, reject) => {
+    const req = httpMod.request(
+      {
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: `${target.pathname}${target.search}`,
+        method: 'POST',
+        family: 4,
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        timeout: config().timeoutMs,
+      },
+      (res) => {
+        let raw = '';
+        res.on('data', (c) => { raw += c; });
+        res.on('end', () => {
+          let j = null;
+          try { j = JSON.parse(raw); } catch { /* giữ raw */ }
+          if (res.statusCode >= 200 && res.statusCode < 300) return resolve(j);
+          const err = new Error(`OpenAI-compatible HTTP ${res.statusCode}: ${(j?.error?.message || raw).slice(0, 300)}`);
+          err.status = res.statusCode;
+          err.retryable = [429, 500, 502, 503].includes(res.statusCode);
+          return reject(err);
+        });
+      },
+    );
+    req.on('timeout', () => req.destroy(new Error(`LLM timeout sau ${config().timeoutMs}ms`)));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+  const choice = json?.choices?.[0]?.message || {};
+  const text = String(choice.content || '').trim();
+  const reasoning = choice.reasoning_content || choice.reasoning || null;
+  if (!text) throw Object.assign(new Error('LLM UIT không trả về nội dung'), { retryable: true });
+  const u = json?.usage || {};
+  const n = (v) => (Number.isFinite(Number(v)) && Number(v) >= 0 ? Math.trunc(Number(v)) : 0);
+  return { text, reasoning, usage: { promptTokens: n(u.prompt_tokens), completionTokens: n(u.completion_tokens), totalTokens: n(u.total_tokens) || n(u.prompt_tokens) + n(u.completion_tokens) } };
+};
+
+const callModel = async (model, { system, prompt, jsonMode, temperature, maxOutputTokens, reasoning = false }) => {
   const c = config();
+  // HERMES: reasoning=true + có cấu hình Qwen riêng → đi đường Qwen thinking.
+  if (reasoning && c.reasoningBaseUrl && c.reasoningModel) {
+    return callOpenAICompatible({
+      baseUrl: c.reasoningBaseUrl, apiKey: c.reasoningKey, model: c.reasoningModel,
+      system, prompt, jsonMode, temperature, maxOutputTokens,
+    });
+  }
+  if (c.provider === 'openai-compatible') {
+    return callOpenAICompatible({
+      baseUrl: c.baseUrl, apiKey: c.apiKey, model,
+      system, prompt, jsonMode, temperature, maxOutputTokens,
+    });
+  }
   const url = `${c.baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(c.apiKey)}`;
   const body = {
     contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -233,9 +326,28 @@ const generateText = async (opts = {}) => {
   if (!isConfigured()) {
     throw new Error(`Chua cau hinh LLM cloud (LLM_PROVIDER=${c.provider}). Can GEMINI_API_KEY trong .env`);
   }
-  const { system, prompt, jsonMode = false, temperature = 0.2, maxOutputTokens = 2048 } = opts;
+  const { system, prompt, jsonMode = false, temperature = 0.2, maxOutputTokens = 2048, reasoning = false } = opts;
   const task = opts.task || "OTHER";
   const startedAt = Date.now();
+  // HERMES: đường UIT openai-compatible chỉ có 1 model chính (+ Qwen reasoning),
+  // không có fallback chain Gemini. Gọi thẳng để LlmUsageLog.provider ghi đúng.
+  if (c.provider === "openai-compatible") {
+    const rc = reasoning ? reasoningConfig() : null;
+    const useModel = reasoning && rc ? rc.model : (opts.model || c.model);
+    try {
+      const { text, usage } = reasoning && rc
+        ? await callOpenAICompatible({ baseUrl: rc.baseUrl, apiKey: rc.apiKey, model: rc.model, system, prompt, jsonMode, temperature, maxOutputTokens })
+        : await callModel(useModel, { system, prompt, jsonMode, temperature, maxOutputTokens });
+      lastUsage = { task, provider: c.provider, model: useModel, ...usage, latencyMs: Date.now() - startedAt };
+      await recordUsage({ task, provider: c.provider, model: useModel, mode: opts.mode || "live", usage, latencyMs: lastUsage.latencyMs, succeeded: true });
+      return text;
+    } catch (e) {
+      await recordUsage({ task, provider: c.provider, model: useModel, mode: opts.mode || "live", usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 }, latencyMs: Date.now() - startedAt, succeeded: false, responseText: String(e.message).slice(0, 500) });
+      // Ràng buộc mạng UIT (chỉ trong mạng trường/VPN): lỗi mạng → caller
+      // (orchestrator) tự fallback Gemini theo llm-policy, ở đây chỉ ném rõ.
+      throw new Error(`${e.message} (LLM UIT — kiểm tra mạng trường/VPN + LLM_BASE_URL)`);
+    }
+  }
 
   const primary = activeModel || c.model;
   const chain = [primary, ...fallbackModels().filter((m) => m !== primary)];
@@ -295,10 +407,15 @@ const parseJsonLoose = (text) => {
 
 const listModels = async () => {
   const c = config();
-  if (!isConfigured()) throw new Error("Chua cau hinh LLM cloud (thieu GEMINI_API_KEY)");
+  if (!isConfigured()) throw new Error("Chua cau hinh LLM cloud (thieu GEMINI_API_KEY / LLM_API_KEY)");
+  if (c.provider === "openai-compatible") {
+    // Gateway UIT không có endpoint /models chuẩn — trả về model đã cấu hình
+    // để check:llm vẫn xanh khi gọi được.
+    return [c.model, ...(c.reasoningModel ? [c.reasoningModel] : [])].filter(Boolean);
+  }
   const json = await getJson(`${c.baseUrl}/models?key=${encodeURIComponent(c.apiKey)}&pageSize=100`);
   return (json.models || []).map((m) => m.name.replace(/^models\//, ""));
 };
 
-module.exports = { isConfigured, describe, generateText, listModels, parseJsonLoose, config, getLastUsage, resetLastUsage, readUsage };
+module.exports = { isConfigured, describe, reasoningConfig, generateText, listModels, parseJsonLoose, config, getLastUsage, resetLastUsage, readUsage };
 

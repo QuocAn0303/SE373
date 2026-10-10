@@ -95,6 +95,28 @@ const createDataRequest = (sessionId, tool, params, user = {}) =>
     requestedById: user.id || null,
   }));
 
+// HERMES Phase 1.2: bật notification cho gate (cột humanGateId/requiresAction đã
+// có từ trước nhưng chưa ai set). Lỗi notification không làm hỏng gate.
+const notifyGateCreated = async (gate) => {
+  try {
+    await prisma.notification.create({
+      data: {
+        // NotificationType enum — AI_ACTION không tồn tại (smoke-chatops đã bắt).
+        type: gate?.actionType === PO_PROPOSAL ? 'PO_PENDING_APPROVAL' : 'SYSTEM',
+        severity: 'WARNING',
+        title: `Chờ duyệt: ${gate.actionSummary}`.slice(0, 200),
+        message: gate.actionSummary,
+        roleScope: 'MANAGER',
+        meta: { gateId: gate.id, sessionId: gate.sessionId, actionType: gate.actionType },
+        humanGateId: gate.id,
+        requiresAction: true,
+      },
+    });
+  } catch (e) {
+    logger.warn(`[Agent Gate] notification gate ${gate?.id} bỏ qua: ${e.message}`);
+  }
+};
+
 const DATA_REQUEST_REPLY =
   'Dữ liệu bạn yêu cầu thuộc loại nhạy cảm (thông tin khách hàng, nhân viên hoặc tài chính). ' +
   'Yêu cầu đã được gửi tới ADMIN/MANAGER để phê duyệt. Kết quả sẽ được cập nhật sau khi được duyệt.';
@@ -439,7 +461,8 @@ router.post('/chat', async (req, res, next) => {
         // M3: role thấp hỏi tool nhạy cảm → tạo request chờ phê duyệt
         stepType = 'TOOL_CALL';
         try {
-          await createDataRequest(session.id, intent.tool, intent.params, req.user);
+          const gate = await createDataRequest(session.id, intent.tool, intent.params, req.user);
+          await notifyGateCreated(gate);
           reply = DATA_REQUEST_REPLY;
         } catch (gateErr) {
           logger.error(`[Agent Gate] Không tạo được DATA_REQUEST cho ${intent.tool}: ${gateErr.message}`);
@@ -457,7 +480,8 @@ router.post('/chat', async (req, res, next) => {
             // M3: fallback tool nhạy cảm → request chờ phê duyệt
             stepType = 'TOOL_CALL';
             try {
-              await createDataRequest(session.id, dbResult.tool, dbResult.params, req.user);
+              const gate = await createDataRequest(session.id, dbResult.tool, dbResult.params, req.user);
+              await notifyGateCreated(gate);
               reply = DATA_REQUEST_REPLY;
             } catch (gateErr) {
               logger.error(`[Agent Gate] Không tạo được DATA_REQUEST cho ${dbResult.tool}: ${gateErr.message}`);
@@ -566,13 +590,13 @@ router.post('/feedback', async (req, res, next) => {
   }
 });
 
-// ─── Analytics ───
+// ─── Analytics (HERMES Phase 6: + gate SLA, approve/reject, token/user) ───
 router.get('/analytics', async (req, res, next) => {
   try {
     const startOfToday = new Date();
     startOfToday.setHours(0, 0, 0, 0);
 
-    const [totalSessions, avgLatencyAgg, feedback] = await Promise.all([
+    const [totalSessions, avgLatencyAgg, feedback, gates, tokens] = await Promise.all([
       prisma.agentSession.count({ where: { createdAt: { gte: startOfToday } } }),
       prisma.agentStep.aggregate({
         where: { session: { createdAt: { gte: startOfToday } }, durationMs: { not: null } },
@@ -583,7 +607,30 @@ router.get('/analytics', async (req, res, next) => {
         _count: { rating: true },
         where: { session: { createdAt: { gte: startOfToday } } },
       }),
+      prisma.agentHumanGate.groupBy({
+        by: ['status'],
+        _count: { status: true },
+        where: { createdAt: { gte: startOfToday } },
+      }).catch(() => []),
+      prisma.llmUsageLog.aggregate({
+        where: { createdAt: { gte: startOfToday } },
+        _sum: { totalTokens: true, promptTokens: true, completionTokens: true },
+        _count: { id: true },
+      }).catch(() => ({ _sum: {}, _count: {} })),
     ]);
+
+    // Gate SLA: thời gian duyệt trung bình (decidedAt - createdAt) của gate hôm nay.
+    let gateSlaMs = null;
+    try {
+      const decided = await prisma.agentHumanGate.findMany({
+        where: { createdAt: { gte: startOfToday }, decidedAt: { not: null } },
+        select: { createdAt: true, decidedAt: true },
+        take: 200,
+      });
+      if (decided.length) {
+        gateSlaMs = Math.round(decided.reduce((s, g) => s + (new Date(g.decidedAt) - new Date(g.createdAt)), 0) / decided.length);
+      }
+    } catch { /* giữ null */ }
 
     res.json({
       success: true,
@@ -591,6 +638,14 @@ router.get('/analytics', async (req, res, next) => {
         totalSessions,
         avgLatency: avgLatencyAgg._avg.durationMs || 0,
         feedback: feedback.map(f => ({ rating: f.rating, _count: f._count.rating })),
+        gates: gates.map((g) => ({ status: g.status, count: g._count.status })),
+        gateSlaMs,
+        tokens: {
+          calls: tokens._count?.id || 0,
+          total: tokens._sum?.totalTokens || 0,
+          prompt: tokens._sum?.promptTokens || 0,
+          completion: tokens._sum?.completionTokens || 0,
+        },
       },
     });
   } catch (e) {
@@ -721,14 +776,16 @@ router.post('/human-gates/:id/decide', authorize('ADMIN', 'MANAGER'), async (req
 
     const updated = await prisma.agentHumanGate.findFirst({ where: { id } });
 
-    // ── Tự duyệt: KHÔNG chặn ──────────────────────────────────────────────
-    // Khách SME thường chỉ có MỘT chủ shop là ADMIN; chặn tự duyệt cứng sẽ làm
-    // tính năng vô dụng với đúng nhóm khách chính. Thay vào đó audit bắt buộc ghi
-    // lại. Đề xuất từ SYSTEM_EVENT vốn không có người đề xuất nên luôn false.
+    // ── HERMES Phase 5: cấm self-approval với spend gate ───────────────────
+    // PO là chi tiền: người tạo đề xuất không được tự duyệt (cần người thứ hai).
+    // Gate đọc (DATA_REQUEST) vẫn cho self-approval (chỉ xem, không mất tiền).
+    // SME 1 chủ shop: ADMIN khác hoặc MANAGER duyệt — audit bắt buộc ghi lại.
     const selfApproved =
-      gate.actionType === PO_PROPOSAL &&
       gate.session?.triggerSource === 'USER_CHAT' &&
       gate.session?.userId === req.user.id;
+    if (decision === 'APPROVED' && gate.actionType === PO_PROPOSAL && selfApproved) {
+      throw { status: 409, message: 'Không được tự duyệt đề xuất chi tiền do chính mình tạo (cần người thứ hai)' };
+    }
 
     let po = null;
     if (decision === 'APPROVED') {
@@ -760,6 +817,50 @@ router.post('/human-gates/:id/decide', authorize('ADMIN', 'MANAGER'), async (req
           `[Agent Gate] Gate ${id} đã APPROVED nhưng không đóng được AgentSession ${gate.sessionId}: ${e.message}`,
         );
       }
+    }
+
+    // HERMES Phase 5: mọi decide gate ghi AuditLog + điền agentSessionId
+    // (trước đây AuditLog bỏ trống 2 field này nên không trace được phiên nào duyệt gate nào).
+    try {
+      const step = await prisma.agentStep.findFirst({
+        where: { sessionId: gate.sessionId },
+        orderBy: { sequence: 'desc' },
+        select: { id: true },
+      });
+      await prisma.auditLog.create({
+        data: {
+          userId: req.user.id,
+          action: decision === 'APPROVED' ? 'APPROVE_HUMAN_GATE' : 'REJECT_HUMAN_GATE',
+          entity: 'AgentHumanGate',
+          entityId: id,
+          afterJson: { decision, note: note || null, selfApproved, poId: po?.id || null },
+          agentSessionId: gate.sessionId,
+          agentStepId: step?.id || null,
+          meta: { channel: 'API', actionType: gate.actionType },
+        },
+      });
+    } catch (auditErr) {
+      logger.error(`[Agent Gate] MẤT audit decide gate ${id}: ${auditErr.message}`);
+    }
+    // HERMES: báo cho người đề xuất biết gate đã được xử lý (in-app notification).
+    try {
+      if (gate.session?.userId && gate.session.userId !== req.user.id) {
+        await prisma.notification.create({
+          data: {
+            type: gate.actionType === PO_PROPOSAL ? 'PO_PENDING_APPROVAL' : 'SYSTEM',
+            // NotificationSeverity enum: INFO|WARNING|CRITICAL (SUCCESS không tồn tại).
+            severity: decision === 'APPROVED' ? 'INFO' : 'WARNING',
+            title: decision === 'APPROVED' ? 'Đề xuất đã được duyệt' : 'Đề xuất bị từ chối',
+            message: `${gate.actionSummary} — ${decision === 'APPROVED' ? (po ? `tạo PO ${po.poCode}` : 'đã duyệt') : `lý do: ${note}`}`,
+            userId: gate.session.userId,
+            meta: { gateId: id, decision },
+            humanGateId: id,
+            requiresAction: false,
+          },
+        });
+      }
+    } catch (notifErr) {
+      logger.warn(`[Agent Gate] notification decide bỏ qua: ${notifErr.message}`);
     }
 
     res.json({

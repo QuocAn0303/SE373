@@ -98,6 +98,9 @@ const createOne = async ({
   meta,
   userId = null,
   roleScope = null,
+  // HERMES Phase 1.2: gate notification (cột đã có từ trước nhưng chưa ai set).
+  humanGateId = null,
+  requiresAction = false,
 }) => {
   const data = {
     id: randomUUID(),
@@ -108,6 +111,8 @@ const createOne = async ({
     link: link || null,
     userId,
     roleScope,
+    humanGateId,
+    requiresAction,
   };
   if (meta !== undefined && meta !== null) data.meta = meta;
   const row = await prisma.notification.create({ data });

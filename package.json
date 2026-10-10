@@ -68,7 +68,11 @@
     "llm:policy": "node scripts/check-llm-policy.js",
     "smoke:llm-usage": "node scripts/smoke-llm-usage.js",
     "usertest:scenario": "node scripts/usertest/build-scenario.js",
-    "usertest:summarize": "node scripts/usertest/summarize-results.js"
+    "usertest:summarize": "node scripts/usertest/summarize-results.js",
+    "seed:candora": "node prisma/seed_candora.js",
+    "seed:candora:apply": "node prisma/seed_candora.js --apply",
+    "check:hermes": "node scripts/check-hermes.js",
+    "smoke:chatops": "node scripts/smoke-chatops.js"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.67",

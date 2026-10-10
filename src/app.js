@@ -431,6 +431,12 @@ app.use("/api/search", searchRoutes);
 app.use("/api/push", pushRoutes);
 app.use("/api/bulk", bulkRoutes);
 app.use("/api/documents", documentRoutes);
+// HERMES agent ops (2026-10): ChatOps Telegram + memory + NL-schedule + skill + dept budget
+app.use("/api/chatops", require("./modules/chatops/telegram.routes"));
+app.use("/api/chatops/memory", require("./modules/chatops/memory.routes"));
+app.use("/api/chatops/schedules", require("./modules/chatops/nl-schedule.routes"));
+app.use("/api/agent-skills", require("./modules/agent-skills/agent-skill.routes"));
+app.use("/api/dept-budgets", require("./modules/dept-budget/dept-budget.routes"));
 
 // Sentry error handler (phải trước error middleware)
 if (process.env.SENTRY_DSN) {

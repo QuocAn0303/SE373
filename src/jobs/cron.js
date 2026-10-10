@@ -445,8 +445,22 @@ const startCrons = () => {
     });
   }
 
+  // HERMES Phase 6 — executor lịch báo cáo NL (mỗi 5 phút, instance 0).
+  // Render số liệu từ DB (không cho LLM bịa số) rồi gửi Telegram/email.
+  if (!process.env.NODE_APP_INSTANCE || process.env.NODE_APP_INSTANCE === "0") {
+    cron.schedule("*/5 * * * *", async () => {
+      try {
+        const nl = require("../modules/chatops/nl-schedule.service");
+        const res = await nl.runDueSchedules();
+        if (res.length) logger.info(`[cron] nl-schedule: ${res.filter((r) => r.ok).length}/${res.length} ok`);
+      } catch (e) {
+        logger.error(`[cron] nl-schedule error: ${e && e.message ? e.message : String(e)}`);
+      }
+    });
+  }
+
   logger.info(
-    "[cron] scheduled: human-gate-expiry every 5min, orders hourly, debt 09:00, payroll 25th, period 28th, promo daily, recurring 1st, CRM tasks 08:00, CRM campaigns every minute, depreciation 28th 01:00, lot expiry 07:00, exchange rates 08:30, auto-payroll 25th 06:00, debt-collection 09:00, bank-reco-auto-match 10:00, morning-briefing 07:00, anomaly-detection 08:00, renewal-reminder 08:00, prepaid-allocation 1st 02:00, monthly-depreciation 1st 03:00, weekly-pnl Mon 08:00, auto-close-dormant 1st 04:00, auto-archive 1st 05:00, daily-backup 02:00, webhook-retry every 5min, churn-automation daily 01:00, vendor-scorecard 1st 06:00",
+    "[cron] scheduled: human-gate-expiry every 5min, orders hourly, debt 09:00, payroll 25th, period 28th, promo daily, recurring 1st, CRM tasks 08:00, CRM campaigns every minute, depreciation 28th 01:00, lot expiry 07:00, exchange rates 08:30, auto-payroll 25th 06:00, debt-collection 09:00, bank-reco-auto-match 10:00, morning-briefing 07:00, anomaly-detection 08:00, renewal-reminder 08:00, prepaid-allocation 1st 02:00, monthly-depreciation 1st 03:00, weekly-pnl Mon 08:00, auto-close-dormant 1st 04:00, auto-archive 1st 05:00, daily-backup 02:00, webhook-retry every 5min, churn-automation daily 01:00, vendor-scorecard 1st 06:00, nl-schedule every 5min",
   );
 };
 

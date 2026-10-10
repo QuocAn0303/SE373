@@ -85,6 +85,9 @@ const TENANT_SCOPED_MODELS = new Set([
   // đầu vào phía SRM. Hai bảng này có `tenantId` nên bắt buộc phải khai báo ở
   // đây, nếu không `tests/tenant-scoped-models.contract.test.js` chặn.
   "Partner", "PartnerReferral",
+  // HERMES agent ops (2026-10): ChatOps + memory + skill + dept budget.
+  // Tất cả có tenantId → bắt buộc khai báo, nếu không fail-fast lúc boot.
+  "ChatBinding", "AgentMemory", "AgentSkill", "DeptBudget",
   // CRM Sales Pipeline (2026-09): Lead / Deal / Organization / Contact
   "CrmPipelineStage", "CrmLead", "CrmOrganization", "CrmContact",
   "CrmDeal", "CrmDealItem", "CrmCommunication",
