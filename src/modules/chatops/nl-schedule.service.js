@@ -21,7 +21,10 @@ const DOW_MAP = { cn: 0, t2: 1, t3: 2, t4: 3, t5: 4, t6: 5, t7: 6 };
 /** Parse câu chat → { cron, template, channel, telegramChatId }. Thuần, test được. */
 const parseScheduleChat = (text) => {
   const t = String(text || '').toLowerCase();
-  const hourM = t.match(/(\d{1,2})\s*h(?!.*\d)/) || t.match(/(\d{1,2})\s*giờ/);
+  // Không dùng lookahead `(?!.*\d)`: với "9h sáng t2" chữ số "2" trong "t2" làm
+  // lookahead thất bại ⇒ giờ rơi về mặc định 8 và người dùng bị gửi báo cáo SAI GIỜ,
+  // không có cảnh báo. Bắt số kèm ranh giới không phải chữ số.
+  const hourM = t.match(/(?:^|\D)(\d{1,2})\s*(?:h|giờ)(?:\s|$)/) || t.match(/(?:^|\D)(\d{1,2})\s*(?:h|giờ)/);
   const hour = hourM ? Math.min(Math.max(Number(hourM[1]), 0), 23) : 8;
   let dow = null;
   for (const [k, v] of Object.entries(DOW_MAP)) {
@@ -77,6 +80,22 @@ const createFromChat = async ({ text, user, reportId = null } = {}) => {
   const prisma = require('../../config/prisma');
   if (!text) throw { status: 400, message: 'Thiếu câu chat đặt lịch' };
   const parsed = parseScheduleChat(text);
+
+  // CHỐNG RÒ DỮ LIỆU: `telegramChatId` do người dùng gõ trong chat (#ketoan...).
+  // Nếu lấy đại trà thì bất kỳ user nào cũng ghim báo cáo doanh thu/công nợ của
+  // tenant vào một chat Telegram bất kỳ — tức gửi số liệu tài chính ra ngoài.
+  // Chỉ chấp nhận chat đã BIND của chính người đặt lịch (xem ChatBinding).
+  if (parsed.telegramChatId) {
+    const mine = await prisma.chatBinding.findFirst({
+      where: { tenantId: user.tenantId, userId: user.id, provider: 'TELEGRAM', isActive: true },
+      select: { chatId: true, externalUserId: true },
+    }).catch(() => null);
+    const allowed = [mine?.chatId, mine?.externalUserId].filter(Boolean);
+    if (!allowed.includes(parsed.telegramChatId)) {
+      throw { status: 403, message: 'chatId phải là chat Telegram đã buộc với chính bạn' };
+    }
+  }
+
   let rid = reportId;
   if (!rid) {
     const existing = await prisma.savedReport.findFirst({ where: { name: `Hermes: ${parsed.template}` } }).catch(() => null);
@@ -106,23 +125,79 @@ const createFromChat = async ({ text, user, reportId = null } = {}) => {
 const renderTemplate = async (template) => {
   const prisma = require('../../config/prisma');
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  if (template === 'revenue_daily' || template === 'weekly_pnl') {
+  const startOfWeek = new Date(today.getTime() - today.getDay() * 86400000);
+
+  if (template === 'weekly_pnl') {
+    // TUẦN chứ không phải hôm nay: trước đây weekly_pnl dùng chung nhánh với
+    // revenue_daily (chỉ lấy 1 ngày) ⇒ báo cáo "P&L tuần" gửi số của 1 ngày.
+    const [week, day] = await Promise.all([
+      prisma.order.aggregate({
+        where: { createdAt: { gte: startOfWeek }, status: { not: 'CANCELLED' } },
+        _sum: { total: true }, _count: { id: true },
+      }),
+      prisma.order.aggregate({
+        where: { createdAt: { gte: today }, status: { not: 'CANCELLED' } },
+        _sum: { total: true }, _count: { id: true },
+      }),
+    ]);
+    return {
+      period: 'week',
+      total: Number(week._sum.total || 0),
+      orders: week._count.id,
+      todayTotal: Number(day._sum.total || 0),
+      todayOrders: day._count.id,
+    };
+  }
+
+  if (template === 'revenue_daily') {
     const agg = await prisma.order.aggregate({
       where: { createdAt: { gte: today }, status: { not: 'CANCELLED' } },
       _sum: { total: true }, _count: { id: true },
     });
-    return { total: Number(agg._sum.total || 0), orders: agg._count.id };
+    return { period: 'day', total: Number(agg._sum.total || 0), orders: agg._count.id };
   }
+
   if (template === 'inventory_low') {
-    const rows = await prisma.inventory.findMany({ where: { quantity: { lte: 5 } }, take: 10, include: { product: { select: { name: true, sku: true } } }, orderBy: { quantity: 'asc' } });
-    return { lowCount: rows.length, items: rows.map((r) => ({ sku: r.product?.sku, name: r.product?.name, qty: r.quantity })) };
+    // `take:10` rồi lấy `.length` ⇒ lowCount luôn ≤10, tức báo cáo "tồn kho thấp"
+    // báo "có 10 mã sắp hết" dù thực tế 47 mã. Đếm riêng bằng _count.
+    const [rows, counted] = await Promise.all([
+      prisma.inventory.findMany({
+        where: { quantity: { lte: 5 } }, take: 10,
+        include: { product: { select: { name: true, sku: true } } },
+        orderBy: { quantity: 'asc' },
+      }),
+      prisma.inventory.count({ where: { quantity: { lte: 5 } } }).catch(() => 0),
+    ]);
+    return {
+      lowCount: counted,
+      items: rows.map((r) => ({ sku: r.product?.sku, name: r.product?.name, qty: r.quantity })),
+    };
   }
+
   if (template === 'debts_overdue') {
-    const agg = await prisma.debt.aggregate({ where: { status: { in: ['OVERDUE', 'PENDING'] } }, _sum: { remaining: true }, _count: { id: true } }).catch(() => ({ _sum: {}, _count: {} }));
-    return { total: Number(agg._sum?.remaining || 0), count: agg._count?.id || 0 };
+    // QUÁ HẠN = dueDate đã qua và khoản chưa đóng. Trước đây lấy
+    // `status PENDING` (giá trị không tồn tại trong DebtStatus: OPEN/PARTIAL/
+    // CLOSED/OVERDUE) ⇒ truy vấn luôn hỏng, rơi về `.catch(() => 0)` và báo cáo
+    // ra 0 đồng — sai hoàn toàn mà không có dấu hiệu lỗi.
+    // `Debt` KHÔNG có cột `remaining`: số dư = amount - paidAmount.
+    const now = new Date();
+    const rows = await prisma.debt.findMany({
+      where: {
+        dueDate: { lt: now },
+        status: { in: ['OPEN', 'PARTIAL', 'OVERDUE'] },
+      },
+      select: { amount: true, paidAmount: true },
+    }).catch(() => []);
+    const total = rows.reduce(
+      (s, d) => s + (Number(d.amount || 0) - Number(d.paidAmount || 0)),
+      0,
+    );
+    const count = rows.length;
+    return { period: 'overdue', total, count, avg: count ? Math.round(total / count) : 0 };
   }
+
   const count = await prisma.order.count({ where: { createdAt: { gte: today } } });
-  return { orders: count };
+  return { period: 'day', orders: count };
 };
 
 /** Tóm tắt LLM cho nhận định (số liệu đã có từ query). Lỗi → dùng mẫu. */
@@ -141,12 +216,20 @@ const summarize = async (template, figures) => {
   return `Báo cáo ${template}: ${JSON.stringify(figures)} (tạo bằng mẫu — LLM chưa sẵn sàng)`;
 };
 
-/** Executor: chạy các lịch đến hạn (gọi từ cron mỗi 5 phút). */
-const runDueSchedules = async () => {
+/**
+ * Executor: chạy các lịch đến hạn (gọi từ cron mỗi 5 phút).
+ *
+ * `tenantId` giới hạn phạm vi: cron truyền `null` (chạy mọi tenant, an toàn vì
+ * đây là tiến trình server), còn route thủ công truyền tenant của người gọi —
+ * nếu không, một MANAGER tenant A sẽ kích hoạt được lịch của tenant B.
+ */
+const runDueSchedules = async ({ tenantId = null } = {}) => {
   const prisma = require('../../config/prisma');
   const now = new Date();
+  const where = { isActive: true, nextRunAt: { lte: now } };
+  if (tenantId) where.tenantId = tenantId;
   const due = await prisma.reportSchedule.findMany({
-    where: { isActive: true, nextRunAt: { lte: now } },
+    where,
     include: { report: { select: { id: true, name: true } } },
     take: 20,
   }).catch(() => []);

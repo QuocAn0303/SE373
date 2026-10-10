@@ -46,10 +46,32 @@ describe('agent memory (Phase 3)', () => {
     const mem = require('../src/modules/chatops/memory.service');
     const orch = require('../src/modules/chatops/orchestrator.service');
     const { saveCandidate } = mem;
-    const out = await saveCandidate({ key: 'closing_supplier', fact: 'NCC đã chốt là An Khang', scope: 'DEPT', departmentId: 'd-sales', createdById: 'u1' });
+    // DEPT fact chỉ MANAGER/ADMIN được ghi (review: trước đây user thường ghi
+    // được fact ACTIVE vào system prompt của phòng mình — prompt injection).
+    const out = await saveCandidate({
+      key: 'closing_supplier', fact: 'NCC đã chốt là An Khang',
+      scope: 'DEPT', departmentId: 'd-sales', createdById: 'u1',
+      user: { id: 'u1', role: 'MANAGER', deptCode: 'SALES' },
+    });
     expect(out.memory.status).toBe('ACTIVE'); // DEPT active ngay
     const recalled = await orch.recallMemories(store.prisma, 't1', 'SALES');
     expect(recalled.map((r) => r.key)).toContain('closing_supplier');
+  });
+
+  test('user KHÔNG phải MANAGER bị chặn khi ghi fact DEPT (403)', async () => {
+    const mem = require('../src/modules/chatops/memory.service');
+    await expect(mem.saveCandidate({
+      key: 'k', fact: 'f', scope: 'DEPT', createdById: 'u-cashier',
+      user: { id: 'u-cashier', role: 'CASHIER', deptCode: 'SALES' },
+    })).rejects.toMatchObject({ status: 403 });
+  });
+
+  test('MANAGER không ghi được fact cho phòng khác (403)', async () => {
+    const mem = require('../src/modules/chatops/memory.service');
+    await expect(mem.saveCandidate({
+      key: 'k', fact: 'f', scope: 'DEPT', departmentId: 'd-hr', createdById: 'u1',
+      user: { id: 'u1', role: 'MANAGER', deptCode: 'SALES' },
+    })).rejects.toMatchObject({ status: 403 });
   });
 
   test('COMPANY PENDING không recall cho tới khi duyệt', async () => {

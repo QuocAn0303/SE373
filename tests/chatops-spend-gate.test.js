@@ -41,6 +41,14 @@ const fakeStore = () => {
       auditLog: { create: jest.fn(async () => ({})) },
       notification: { create: jest.fn(async () => ({})) },
       inventory: { findMany: jest.fn(async () => []) },
+      // Orchestrator resolve product/vendor THẬT trước khi dựng gate PO.
+      // Không có 2 bản ghi này thì PO gate không dựng được (đúng chủ ý).
+      product: {
+        findFirst: jest.fn(async () => null),
+      },
+      vendor: {
+        findFirst: jest.fn(async () => null),
+      },
     },
   };
 };
@@ -65,15 +73,53 @@ describe('spend gate qua chat (Phase 1.2/5)', () => {
     expect(g.actionSummary).toBeTruthy(); // hợp đồng humangate: actionSummary bắt buộc
   });
 
+  test('PO không resolve được SKU/NCC thì KHÔNG dựng gate PO giả (chuyển sang hỏi lại)', async () => {
+    // product.findFirst trả null ⇒ không có payload PO bịa đặt.
+    const { processMessage } = require('../src/modules/chatops/orchestrator.service');
+    const out = await processMessage({ text: 'tạo PO nhập thêm 10 cái', user: { id: 'maker-1', role: 'MANAGER', tenantId: 't1' } });
+    const g = store.gates.get(out.gateId);
+    expect(g.actionType).toBe('DATA_REQUEST');
+    expect(g.actionPayload.tool).toBe('create_po_needs_clarification');
+    // Quan trọng: không có payload PO với productId/vendorId bịa ('CHATOPS').
+    expect(JSON.stringify(g.actionPayload)).not.toContain('CHATOPS');
+  });
+
+  test('PO có SKU + NCC thật thì mới dựng gate PO_PROPOSAL với id thật', async () => {
+    store.prisma.product.findFirst.mockResolvedValueOnce({ id: 'p1', name: 'Sáp treo', sku: 'SAP-1', costPrice: 30000, price: 60000 });
+    store.prisma.vendor.findFirst.mockResolvedValueOnce({ id: 'v1', name: 'NCC An Khang' });
+    const { processMessage } = require('../src/modules/chatops/orchestrator.service');
+    const out = await processMessage({ text: 'tạo PO nhập thêm 10 sáp treo từ NCC An Khang', user: { id: 'maker-1', role: 'MANAGER', tenantId: 't1' } });
+    const g = store.gates.get(out.gateId);
+    expect(g.actionType).toBe('PURCHASE_ORDER_PROPOSAL');
+    // vendorId nằm ở gốc payload (xem buildPoProposalGate), không nằm trong items.
+    expect(g.actionPayload.items[0].productId).toBe('p1');
+    expect(g.actionPayload.vendorId).toBe('v1');
+    expect(g.actionPayload.totalEstimate).toBeGreaterThan(0);
+  });
+
   test('self-approve PO 409; người thứ hai từ chối OK; double-decide 409', async () => {
+    // Self-approval CHỈ chặn với gate PO_PROPOSAL (chi tiền). Nên test này cần
+    // SKU + NCC thật để orchestrator dựng đúng gate PO.
+    store.prisma.product.findFirst.mockResolvedValue({ id: 'p1', name: 'Sáp treo', sku: 'SAP-1', costPrice: 30000, price: 60000 });
+    store.prisma.vendor.findFirst.mockResolvedValue({ id: 'v1', name: 'NCC An Khang' });
     const { processMessage } = require('../src/modules/chatops/orchestrator.service');
     const { decideGateAs } = require('../src/modules/chatops/telegram.routes');
-    const out = await processMessage({ text: 'tạo PO nhập thêm', user: { id: 'maker-1', role: 'MANAGER', tenantId: 't1' } });
+    const out = await processMessage({ text: 'tạo PO nhập thêm 10 sáp treo từ NCC An Khang', user: { id: 'maker-1', role: 'MANAGER', tenantId: 't1' } });
+    expect(store.gates.get(out.gateId).actionType).toBe('PURCHASE_ORDER_PROPOSAL');
     await expect(decideGateAs('maker-1', out.gateId, 'APPROVED', 'tự duyệt')).rejects.toMatchObject({ status: 409 });
     const r = await decideGateAs('approver-1', out.gateId, 'REJECTED', 'hết ngân sách');
     expect(r.decision).toBe('REJECTED');
     await expect(decideGateAs('approver-1', out.gateId, 'APPROVED', 'x')).rejects.toMatchObject({ status: 409 });
     // decide ghi audit
     expect(store.prisma.auditLog.create).toHaveBeenCalled();
+  });
+
+  test('gate DATA_REQUEST (đọc) vẫn cho self-approval — không phải chi tiền', async () => {
+    const { processMessage } = require('../src/modules/chatops/orchestrator.service');
+    const { decideGateAs } = require('../src/modules/chatops/telegram.routes');
+    const out = await processMessage({ text: 'tạo PO nhập thêm 10 cái', user: { id: 'maker-1', role: 'MANAGER', tenantId: 't1' } });
+    expect(store.gates.get(out.gateId).actionType).toBe('DATA_REQUEST');
+    const r = await decideGateAs('maker-1', out.gateId, 'REJECTED', 'cần SKU cụ thể');
+    expect(r.decision).toBe('REJECTED');
   });
 });

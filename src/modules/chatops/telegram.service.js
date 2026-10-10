@@ -34,6 +34,18 @@ const callApi = async (method, body) => {
   return json.result;
 };
 
+/**
+ * Escape ký tự Markdown của Telegram (parse_mode legacy 'Markdown').
+ *
+ * VÌ SAO PHẢI: reply của agent chứa dữ liệu DB (tên sản phẩm, tên khách, fact
+ * memory, actionSummary). Một ký tự `_ * [ ` trần trong dữ liệu làm Telegram
+ * trả 400 và TIN NHẮN BỊ BỎ — gate duyệt tiền mà người dùng không thấy.
+ * Escape trước rồi mới bọc phần định dạng của ta bằng backtick/code.
+ */
+const escapeMd = (s) => String(s ?? '')
+  .replace(/\\/g, '\\\\')
+  .replace(/([_*[\]()])/g, '\\$1');
+
 /** Gửi tin nhắn text (Markdown). */
 const sendMessage = async (chatId, text, extra = {}) =>
   callApi('sendMessage', {
@@ -59,12 +71,12 @@ const sendGateCard = async (chatId, gate) => {
   const amount = gate?.actionPayload?.totalEstimate ?? gate?.actionPayload?.remaining ?? '';
   const lines = [
     '🔔 *Yêu cầu phê duyệt*',
-    `• Loại: \`${gate.actionType}\``,
-    `• Nội dung: ${gate.actionSummary}`,
+    `• Loại: \`${escapeMd(gate.actionType)}\``,
+    `• Nội dung: ${escapeMd(gate.actionSummary)}`,
     amount !== '' ? `• Số tiền ước tính: *${Number(amount).toLocaleString('vi-VN')}đ*` : null,
-    `• Hết hạn: ${new Date(gate.expiresAt).toLocaleString('vi-VN')}`,
+    `• Hết hạn: ${escapeMd(new Date(gate.expiresAt).toLocaleString('vi-VN'))}`,
     '',
-    '_Bấm nút bên dưới để duyệt/từ chối. Từ chối cần nhập lý do (rep tin nhắn /decide). _',
+    '_Bấm nút bên dưới để duyệt/từ chối. Từ chối cần nhập lý do (nhắn /decide)._',
   ].filter(Boolean);
   return sendMessage(chatId, lines.join('\n'), gateKeyboard(gate.id));
 };
@@ -73,13 +85,14 @@ const sendGateCard = async (chatId, gate) => {
 const answerCallback = async (callbackQueryId, text = '', showAlert = false) =>
   callApi('answerCallbackQuery', { callback_query_id: callbackQueryId, text: String(text).slice(0, 200), show_alert: showAlert });
 
-/** Chuyển Markdown reply của agent sang quote block Telegram (Phase 2 citation). */
+/** Chuyển reply của agent + citation sang khối trích dẫn Telegram (Phase 2). */
 const formatCitedReply = (text, citations = []) => {
   let out = clip(text, 3000);
   if (citations.length) {
     out += '\n\n📚 *Nguồn:*';
     citations.slice(0, 5).forEach((c, i) => {
-      out += `\n${i + 1}. *${c.docTitle}* — ${c.section || ''} (độ khớp ${Math.round((c.similarity || 0) * 100)}%)\n> ${String(c.quote || '').slice(0, 200)}`;
+      out += `\n${i + 1}. *${escapeMd(c.docTitle)}* — ${escapeMd(c.section || '')} (độ khớp ${Math.round((c.similarity || 0) * 100)}%)`
+        + `\n> ${escapeMd(String(c.quote || '').slice(0, 200))}`;
     });
   }
   return out;
@@ -92,5 +105,6 @@ module.exports = {
   gateKeyboard,
   answerCallback,
   formatCitedReply,
+  escapeMd,
   clip,
 };

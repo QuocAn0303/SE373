@@ -44,31 +44,88 @@ const submitForApproval = async ({ id }) => {
  * Chạy sandbox: thực thi handler trong transaction rồi rollback — testReport ghi
  * lại kết quả mà không đổi DB. Handler chi tiền bị chặn ngay trong sandbox.
  */
-const runSandbox = async ({ id }) => {
+const HANDLER_ROOT = '../chatops/dept';
+
+/** Nạp handler theo `handlerRef` (vd "sales.agent", "dept/ops.agent"). */
+const loadHandler = async (ref) => {
+  if (!ref) return null;
+  // handlerRef là mã định danh, không phải đường dẫn tùy ý. Chỉ chấp nhận tên
+  // file trong thư mục dept/ — chặn `../../` và path traversal.
+  const safe = String(ref).replace(/\.agent$/, '');
+  if (!/^[a-z][a-z0-9_]*$/i.test(safe)) {
+    return { error: 'handlerRef không hợp lệ (chỉ chấp nhận tên agent: sales, ops, cskh…)' };
+  }
+  try {
+    return require(`${HANDLER_ROOT}/${safe}.agent`);
+  } catch (e) {
+    return { error: `không nạp được handler "${ref}": ${e.message}` };
+  }
+};
+
+/**
+ * Chạy thử skill: nếu handlerRef trỏ tới agent có tool write, chạy TOOL ĐỌC đầu
+ * tiên của agent trong transaction rồi rollback; nếu handler không có write tool
+ * thì vẫn chạy (đọc là an toàn). Skill chạm tiền bị SKIP trước khi vào sandbox.
+ */
+const runSandbox = async ({ id, sample = null }) => {
   const prisma = needClient();
   const s = await prisma.agentSkill.findFirst({ where: { id } });
   if (!s) throw { status: 404, message: 'Skill không tồn tại' };
+
   if (s.handlerRef && SPEND_HANDLER_RE.test(s.handlerRef)) {
     const report = { ok: false, reason: 'SKIP_SPEND', message: 'Skill chạm tiền/kho — sandbox từ chối, duyệt từng lần qua gate' };
     await prisma.agentSkill.update({ where: { id }, data: { testReport: report } });
     return report;
   }
-  // Sandbox thật: mở transaction tương tác, chạy kiểm tra đọc rồi rollback.
+
+  const loaded = await loadHandler(s.handlerRef);
+  if (loaded && loaded.error) {
+    const report = { ok: false, reason: 'HANDLER_INVALID', message: loaded.error };
+    await prisma.agentSkill.update({ where: { id }, data: { testReport: report } });
+    return report;
+  }
+
+  const agent = loaded || null;
+  const readTool = (agent?.tools || []).find((t) => !(agent?.writeTools || []).includes(t));
+
+  // Sandbox thật: mở transaction tương tác, chạy tool, ROLLBACK. Nếu handler
+  // không có tool đọc nào thì chỉ kiểm tra kết nối + ghi rõ điều đó trong report
+  // (không giả vờ đã chạy).
   const report = await prisma.$transaction(async (tx) => {
-    await tx.$queryRawUnsafe('SELECT 1');
-    return { ok: true, at: new Date().toISOString(), note: 'sandbox rollback — không đổi DB' };
-  }).catch((e) => ({ ok: false, reason: 'SANDBOX_ERROR', message: e.message }));
+    if (!agent) return { ok: false, reason: 'NO_HANDLER', message: 'skill không có handlerRef — chưa kiểm thử được', at: new Date().toISOString() };
+    if (!readTool) {
+      return { ok: false, reason: 'NO_READ_TOOL', message: 'handler chỉ có tool ghi — sandbox không chạy được', at: new Date().toISOString() };
+    }
+    const out = await agent.handle(readTool, sample || {}, {});
+    return {
+      ok: true,
+      tool: readTool,
+      at: new Date().toISOString(),
+      sampleChars: String(out?.message || out?.summary || '').length,
+      note: 'sandbox rollback — không đổi DB',
+    };
+  }).catch((e) => ({ ok: false, reason: 'SANDBOX_ERROR', message: e.message, at: new Date().toISOString() }));
+
   await prisma.agentSkill.update({ where: { id }, data: { testReport: report } });
   return report;
 };
 
-/** Duyệt (PENDING → APPROVED). Yêu cầu đã qua sandbox (testReport.ok hoặc SKIP_SPEND). */
+/**
+ * Duyệt (PENDING → APPROVED). Điều kiện bắt buộc: đã chạy sandbox VÀ sandbox
+ * pass (`ok:true`) hoặc được miễn vì skill chạm tiền (`SKIP_SPEND`).
+ * Trước đây chỉ kiểm `!testReport` nên report `{ok:false}` vẫn qua duyệt —
+ * tức "bắt buộc chạy sandbox" là hợp đồng không có tác dụng.
+ */
 const approve = async ({ id, userId }) => {
   const prisma = needClient();
   const s = await prisma.agentSkill.findFirst({ where: { id } });
   if (!s) throw { status: 404, message: 'Skill không tồn tại' };
   if (s.status !== 'PENDING') throw { status: 409, message: `Skill đang ${s.status}` };
   if (!s.testReport) throw { status: 400, message: 'Skill chưa chạy sandbox' };
+  const passed = s.testReport.ok === true || s.testReport.reason === 'SKIP_SPEND';
+  if (!passed) {
+    throw { status: 409, message: `Sandbox không đạt (${s.testReport.reason || 'không rõ'}) — không duyệt` };
+  }
   return prisma.agentSkill.update({
     where: { id }, data: { status: 'APPROVED', decidedById: userId, decidedAt: new Date() },
   });

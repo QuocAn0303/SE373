@@ -52,7 +52,9 @@ const authorizeDept = (...deptCodes) => {
 const deptScope = (user, field = 'departmentId', deptId = null) => {
   if (!user) return { [field]: '__no_user__' };
   if (BYPASS_ROLES.has(user.role)) return {};
-  if (user.role === 'MANAGER' && !deptId) return {}; // MANAGER chưa xếp phòng: giữ hành vi cũ
+  // FAIL-CLOSED: không xác định được phòng thì KHÔNG trả `{}` (thấy tất cả).
+  // Trước đây MANAGER chưa xếp phòng nhận `{}` ⇒ nhìn thấy toàn bộ tenant —
+  // đúng cái lỗi mà lớp phân quyền này sinh ra để chặn.
   return { [field]: deptId || '__no_dept__' };
 };
 

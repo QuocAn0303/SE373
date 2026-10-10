@@ -44,6 +44,12 @@ const config = () => {
   // Ngoài mạng trường/VPN → fallback Gemini cloud free (LLM_PROVIDER=gemini).
   const key = process.env.LLM_API_KEY || process.env.GEMINI_API_KEY || "";
   const provider = (process.env.LLM_PROVIDER || (key ? "gemini" : "local")).toLowerCase();
+  // KHÔNG bao giờ fallback chéo provider cho endpoint reasoning: nếu
+  // LLM_REASONING_API_KEY thiếu mà LLM_PROVIDER=gemini, `key` là GEMINI_API_KEY
+  // và sẽ được gửi tới llm.uit.edu.vn — lộ secret của provider khác ra host
+  // bên thứ ba. Endpoint reasoning chỉ dùng key explicit, hoặc chính key của
+  // provider openai-compatible (cùng hạ tầng, cùng niêm phong).
+  const sameProvider = provider === "openai-compatible";
   return {
     provider,
     apiKey: key,
@@ -51,14 +57,18 @@ const config = () => {
     baseUrl: (process.env.LLM_BASE_URL || DEFAULT_GEMINI_BASE).replace(/\/$/, ""),
     reasoningBaseUrl: (process.env.LLM_REASONING_BASE_URL || "").replace(/\/$/, ""),
     reasoningModel: process.env.LLM_REASONING_MODEL || "",
-    reasoningKey: process.env.LLM_REASONING_API_KEY || key,
+    reasoningKey: process.env.LLM_REASONING_API_KEY || (sameProvider ? key : ""),
     timeoutMs: Number(process.env.LLM_TIMEOUT_MS) || 60000,
   };
 };
 
 const isConfigured = () => {
   const c = config();
-  return c.provider !== "local" && Boolean(c.apiKey || c.provider === "openai-compatible");
+  if (c.provider === "local") return false;
+  // openai-compatible BẮT BUỘC có key: không có key thì header Authorization rỗng
+  // và mọi request đều 401 — coi như chưa cấu hình để không báo "sẵn sàng" sai.
+  if (c.provider === "openai-compatible") return Boolean(c.apiKey);
+  return Boolean(c.apiKey);
 };
 
 /** Cấu hình model suy luận (Qwen thinking). Null khi chưa cấu hình. */

@@ -41,19 +41,25 @@ const ingestDocument = async (docId, opts = {}) => {
   const chunks = chunkText(docText(doc));
   const version = new Date(doc.updatedAt || doc.createdAt || Date.now()).toISOString();
 
-  // Xoá chunk cũ của doc này (re-index khi sửa). Escape tenantId/docId bằng param.
-  await prisma.$executeRawUnsafe(
-    `DELETE FROM ai_documents WHERE entity_type='internal_doc' AND (metadata->>'docId') = $1 AND ("tenant_id" = $2 OR ($2 IS NULL AND "tenant_id" IS NULL))`,
-    doc.id, tenantId,
-  );
+  // Xoá chunk cũ của doc này (re-index khi sửa). Tagged template nội suy giá trị
+  // thành tham số $1..$n của Postgres — không phải nối chuỗi, nên không có
+  // đường SQL injection và không bị scanner đánh dấu `Unsafe`.
+  await prisma.$executeRaw`
+    DELETE FROM ai_documents
+     WHERE entity_type = 'internal_doc'
+       AND (metadata->>'docId') = ${doc.id}
+       AND ("tenant_id" = ${tenantId} OR (${tenantId} IS NULL AND "tenant_id" IS NULL))
+  `;
   for (const c of chunks) {
     const entityId = `${tenantId || 'global'}:${doc.id}:${c.idx}`;
-    const metadata = JSON.stringify({ docId: doc.id, version, section: doc.title, tenantTag: 'mophong' });
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO ai_documents (entity_type, entity_id, content, metadata, "tenant_id") VALUES ('internal_doc', $1, $2, $3::jsonb, $4)
-       ON CONFLICT (entity_type, entity_id) DO UPDATE SET content=EXCLUDED.content, metadata=EXCLUDED.metadata, updated_at=now()`,
-      entityId, c.content, metadata, tenantId,
-    );
+    await prisma.$executeRaw`
+      INSERT INTO ai_documents (entity_type, entity_id, content, metadata, "tenant_id")
+      VALUES ('internal_doc', ${entityId}, ${c.content}, ${JSON.stringify({
+        docId: doc.id, version, section: doc.title, tenantTag: 'mophong',
+      })}::jsonb, ${tenantId})
+      ON CONFLICT (entity_type, entity_id)
+      DO UPDATE SET content = EXCLUDED.content, metadata = EXCLUDED.metadata, updated_at = now()
+    `;
   }
   logger.info(`[ingest] internal_doc ${doc.id} → ${chunks.length} chunk(s) (tenant=${tenantId || 'global'})`);
   return { docId: doc.id, chunks: chunks.length, version };

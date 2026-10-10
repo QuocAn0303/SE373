@@ -4163,8 +4163,13 @@ model ChatBinding {
   provider       String   @default("TELEGRAM") // TELEGRAM (sau này: SLACK/DISCORD)
   externalUserId String   // telegramUserId (chat.id người nhắn)
   chatId         String?  // chat đích nhận reply (riêng/tư hoặc group)
-  otpCode        String?  // OTP chờ xác thực (null sau khi đã bind)
+  // OTP lưu HASH (sha256), không lưu plaintext: endpoint webhook là public, đoán
+  // 6 chữ số rồi chiếm tài khoản ADMIN/MANAGER là đường chiếm tài khoản.
+  // `otpAttempts` đếm số lần sai; vượt OTP_MAX_ATTEMPTS thì khoá tới `otpLockedUntil`.
+  otpCode        String?  // sha256 của mã OTP
   otpExpiresAt   DateTime?
+  otpAttempts    Int       @default(0)
+  otpLockedUntil DateTime?
   isActive       Boolean  @default(true)
   lastUpdateId   String?  // update_id Telegram cuối đã xử lý (idempotency)
   createdAt      DateTime @default(now())

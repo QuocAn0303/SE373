@@ -4,6 +4,7 @@
 const express = require('express');
 const { authenticate, authorize } = require('../../middleware/auth.middleware');
 const { requireModule } = require('../../middleware/plan.middleware');
+const { deptScope, getUserDeptCode } = require('../../middleware/dept.middleware');
 const { success, paginated } = require('../../utils/response');
 
 const router = express.Router();
@@ -14,6 +15,9 @@ router.use(authenticate, requireModule('ai'));
  * /api/dept-budgets:
  *   get:
  *     summary: Liệt kê envelope ngân sách theo tháng
+ *     description: >
+ *       Quản lý thấy mọi phòng; người khác chỉ thấy envelope của phòng mình
+ *       (deptScope — fail-closed khi chưa xếp phòng thì không thấy gì).
  *     tags: [DeptBudget]
  *     security: [{ bearerAuth: [] }]
  *     responses:
@@ -27,6 +31,13 @@ router.get('/', async (req, res, next) => {
     const where = {};
     if (month) where.month = Number(month);
     if (year) where.year = Number(year);
+    // deptScope LÀ thứ khiến authorizeDept không còn là dead code: không có nó,
+    // mọi user đọc được hạn mức chi của mọi phòng khác trong tenant.
+    const deptCode = await getUserDeptCode(prisma, req.user);
+    const dept = deptCode
+      ? await prisma.department.findFirst({ where: { code: deptCode }, select: { id: true } }).catch(() => null)
+      : null;
+    Object.assign(where, deptScope(req.user, 'departmentId', dept?.id || null));
     const [data, total] = await Promise.all([
       prisma.deptBudget.findMany({ where, include: { department: { select: { id: true, code: true, name: true } } }, orderBy: { updatedAt: 'desc' }, skip: (Number(page) - 1) * Number(limit), take: Number(limit) }),
       prisma.deptBudget.count({ where }),

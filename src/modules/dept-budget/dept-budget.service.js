@@ -20,22 +20,29 @@ const currentMonthYear = () => {
   return { month: n.getMonth() + 1, year: n.getFullYear() };
 };
 
-/** Lấy/tạo envelope tháng hiện tại của phòng. */
+/** Lấy/tạo envelope tháng (upsert — tránh race findFirst→create). */
 const envelope = async ({ departmentId, month, year } = {}) => {
   const prisma = needClient();
   const m = month || currentMonthYear().month;
   const y = year || currentMonthYear().year;
-  let row = await prisma.deptBudget.findFirst({ where: { departmentId, month: m, year: y } }).catch(() => null);
-  if (!row) {
-    const tenantId = require('../../config/tenantContext').getTenantId() || null;
-    row = await prisma.deptBudget.create({ data: { tenantId, departmentId, month: m, year: y, limit: 50000000, spent: 0 } });
-  }
-  return row;
+  const { getTenantId } = require('../../config/tenantContext');
+  const tenantId = getTenantId() || null;
+  return prisma.deptBudget.upsert({
+    where: { tenantId_departmentId_month_year: { tenantId, departmentId, month: m, year: y } },
+    create: { tenantId, departmentId, month: m, year: y, limit: 50000000, spent: 0 },
+    update: {}, // không ghi đè limit/spent đã có
+  });
 };
 
 /**
- * Kiểm tra 1 khoản chi. Trả về { allowed, approver, reason, overEnvelope }.
- * - amount <5tr + trong envelope → MANAGER phòng (auto chỉ khi trong envelope).
+ * Kiểm tra 1 khoản chi. Trả về { allowed, approver, reason, overEnvelope, envelope, remaining }.
+ *
+ * `allowed` LUÔN true vì mọi khoản chi đều đi qua gate (nguyên tắc: chi tiền
+ * không bao giờ auto). `allowed` ở đây chỉ nói "khoản này CÓ cần duyệt" — nó
+ * không phải cổng chặn, và trước đây là field trang trí ai cũng tưởng là guard.
+ * Muốn chặn thật thì kiểm `approver` và `overEnvelope`, rồi ép gate.
+ *
+ * - amount <5tr + trong envelope → MANAGER phòng.
  * - 5–50tr → MANAGER phòng; >50tr → ADMIN.
  * - Vượt envelope → auto-escalate lên ADMIN kèm lý do.
  */
@@ -43,16 +50,20 @@ const checkSpend = async ({ departmentId, amount } = {}) => {
   const total = Number(amount || 0);
   const env = await envelope({ departmentId });
   const remaining = Number(env.limit) - Number(env.spent);
-  const overEnvelope = total > remaining;
-  if (overEnvelope) {
-    return { allowed: true, approver: 'ADMIN', overEnvelope: true, envelope: env, reason: `Vượt ngân sách phòng (${remaining.toLocaleString('vi-VN')}đ còn lại) — escalate ADMIN` };
+  const base = { envelope: env, remaining, needsApproval: true };
+  if (total > remaining) {
+    return { ...base, allowed: true, approver: 'ADMIN', overEnvelope: true, reason: `Vượt ngân sách phòng (${remaining.toLocaleString('vi-VN')}đ còn lại) — escalate ADMIN` };
   }
-  if (total < AUTO_LIMIT) return { allowed: true, approver: 'MANAGER', overEnvelope: false, envelope: env, reason: 'Trong envelope, dưới 5tr' };
-  if (total <= MANAGER_LIMIT) return { allowed: true, approver: 'MANAGER', overEnvelope: false, envelope: env, reason: '5–50tr: MANAGER phòng' };
-  return { allowed: true, approver: 'ADMIN', overEnvelope: false, envelope: env, reason: 'Trên 50tr: ADMIN' };
+  if (total < AUTO_LIMIT) return { ...base, allowed: true, approver: 'MANAGER', overEnvelope: false, reason: 'Trong envelope, dưới 5tr' };
+  if (total <= MANAGER_LIMIT) return { ...base, allowed: true, approver: 'MANAGER', overEnvelope: false, reason: '5–50tr: MANAGER phòng' };
+  return { ...base, allowed: true, approver: 'ADMIN', overEnvelope: false, reason: 'Trên 50tr: ADMIN' };
 };
 
-/** Cộng dồn spent sau khi gate spend APPROVED + executed. */
+/**
+ * Cộng dồn spent sau khi gate spend APPROVED + executed.
+ * Dùng `increment` (UPDATE ... SET spent = spent + x) thay vì đọc-rồi-ghi:
+ * hai lần duyệt song song sẽ không làm mất một khoản (read-modify-write mất).
+ */
 const addSpent = async ({ departmentId, amount, month, year } = {}) => {
   const prisma = needClient();
   const m = month || currentMonthYear().month;
@@ -60,7 +71,7 @@ const addSpent = async ({ departmentId, amount, month, year } = {}) => {
   const env = await envelope({ departmentId, month: m, year: y });
   return prisma.deptBudget.update({
     where: { id: env.id },
-    data: { spent: Number(env.spent) + Number(amount || 0) },
+    data: { spent: { increment: Number(amount || 0) } },
   });
 };
 

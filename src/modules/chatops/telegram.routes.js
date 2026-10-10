@@ -17,6 +17,18 @@ const { success, created } = require('../../utils/response');
 
 const router = express.Router();
 
+// Webhook public: limiter RIÊNG thấp hơn apiLimiter. `apiLimiter` bỏ qua đường
+// dẫn này không phải vì cần cho phép cao — mà vì webhook Telegram đếm theo IP của
+// chính Telegram, nên hạn mức phải đủ cho burst hợp lệ nhưng vẫn chặn được việc
+// dò OTP (mỗi lần đoán là 1 request). 30/phút là ngân sách đủ cho webhook thật.
+const webhookLimiter = require('express-rate-limit')({
+  windowMs: 60 * 1000,
+  max: Number(process.env.TELEGRAM_RATE_LIMIT) || 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Quá nhiều request webhook, thử lại sau' },
+});
+
 // Idempotency update_id trong tiến trình (khởi động lại thì ChatBinding.lastUpdateId
 // vẫn chặn trùng ở tầng DB). Học từ lead-capture IDEM 24h.
 const seenUpdates = new Set();
@@ -31,12 +43,31 @@ const markSeen = (id) => {
   return true;
 };
 
+// WEBHOOK LÀ CỔNG PUBLIC VÀO HỆ THỐNG — fail-CLOSED.
+// Nếu secret chưa cấu hình thì ở production ta TỪ CHỐI (503), không mở.
+// Lý do: webhook cho phép impersonate user đã bind và đi tới đường duyệt gate.
+// `req.query.secret` bị bỏ có chủ đích: secret trong URL rò vào access log và
+// vào URL setWebhook của Telegram.
 const verifyWebhook = (req) => {
   const secret = process.env.TELEGRAM_WEBHOOK_SECRET || '';
-  if (!secret) return true; // dev: chưa cấu hình thì cho qua (log cảnh báo 1 lần)
-  const got = req.headers['x-telegram-bot-api-secret-token'] || req.query.secret || '';
-  return got === secret;
+  if (!secret) {
+    if (process.env.NODE_ENV === 'production') {
+      throw { status: 503, message: 'Webhook chưa cấu hình TELEGRAM_WEBHOOK_SECRET — từ chối' };
+    }
+    logger.warn('[chatops] TELEGRAM_WEBHOOK_SECRET chưa set — webhook KHÔNG xác thực (chỉ chấp nhận ở dev)');
+    return true;
+  }
+  const got = String(req.headers['x-telegram-bot-api-secret-token'] || '');
+  const a = Buffer.from(got);
+  const b = Buffer.from(secret);
+  // timingSafeEqual đòi 2 buffer cùng độ dài — so độ dài trước để không ném.
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
 };
+
+// OTP 6 chữ số ⇒ phải chống dò. Lưu HASH (không lưu plaintext) + khoá sau 5 lần.
+const OTP_MAX_ATTEMPTS = 5;
+const otpHash = (code) => crypto.createHash('sha256').update(String(code)).digest('hex');
 
 /**
  * @swagger
@@ -56,10 +87,15 @@ router.get('/bind', authenticate, requireModule('ai'), async (req, res, next) =>
     // ChatBinding cần tenantId trong unique — model mới có thể chưa có trong
     // client cũ → bắt lỗi mềm, hướng dẫn generate.
     if (!prisma.chatBinding) throw { status: 503, message: 'ChatBinding chưa có trong Prisma client — chạy `npx prisma generate` + migrate hermes' };
+    // Lưu HASH, không lưu plaintext (xem migration 20261010120000).
     await prisma.chatBinding.upsert({
       where: { tenantId_userId_provider: { tenantId: req.user.tenantId, userId: req.user.id, provider: 'TELEGRAM' } },
-      create: { tenantId: req.user.tenantId, userId: req.user.id, provider: 'TELEGRAM', externalUserId: `pending:${req.user.id}`, otpCode: otp, otpExpiresAt: expires, isActive: false },
-      update: { otpCode: otp, otpExpiresAt: expires },
+      create: {
+        tenantId: req.user.tenantId, userId: req.user.id, provider: 'TELEGRAM',
+        externalUserId: `pending:${req.user.id}`, otpCode: otpHash(otp), otpExpiresAt: expires,
+        otpAttempts: 0, otpLockedUntil: null, isActive: false,
+      },
+      update: { otpCode: otpHash(otp), otpExpiresAt: expires, otpAttempts: 0, otpLockedUntil: null },
     });
     const bot = process.env.TELEGRAM_BOT_USERNAME ? `@${process.env.TELEGRAM_BOT_USERNAME}` : 'bot Telegram công ty';
     success(res, { otp, expiresAt: expires, guide: `Nhắn tin cho ${bot} với nội dung: /bind ${otp}` });
@@ -75,7 +111,7 @@ router.get('/bind', authenticate, requireModule('ai'), async (req, res, next) =>
  *     responses:
  *       200: { description: Đã nhận }
  */
-router.post('/telegram/webhook', express.json({ limit: '100kb' }), async (req, res, next) => {
+router.post('/telegram/webhook', webhookLimiter, express.json({ limit: '100kb' }), async (req, res, next) => {
   try {
     if (!verifyWebhook(req)) throw { status: 401, message: 'Webhook secret không hợp lệ' };
     const update = req.body || {};
@@ -103,8 +139,20 @@ router.post('/telegram/webhook', express.json({ limit: '100kb' }), async (req, r
         await tg.answerCallback(cb.id, 'Bạn chưa buộc tài khoản — mở app lấy OTP rồi /bind', true).catch(() => null);
         return res.json({ success: true });
       }
-      const out = await runWithTenant(binding.tenantId, () => decideGateAs(binding.userId, gateId, decision, 'Duyệt/Từ chối từ Telegram'));
-      await tg.answerCallback(cb.id, decision === 'APPROVED' ? 'Đã duyệt ✅' : 'Đã từ chối').catch(() => null);
+      let out;
+      try {
+        out = await runWithTenant(binding.tenantId, () => decideGateAs(binding.userId, gateId, decision, 'Duyệt/Từ chối từ Telegram'));
+      } catch (e) {
+        // Người bấm nút phải biết vì sao không duyệt được (self-approve, hết hạn,
+        // đã xử lý…) — im lặng rồi trả 200 là khiến họ bấm lại vô ích.
+        await tg.answerCallback(cb.id, e.message || 'Không duyệt được', true).catch(() => null);
+        if (cb.message?.chat?.id) {
+          await tg.sendMessage(cb.message.chat.id, `⚠️ ${e.message || 'Không duyệt được'}`).catch(() => null);
+        }
+        return res.json({ success: false, message: e.message || 'Không duyệt được' });
+      }
+      // Toast chỉ nói "đã duyệt" khi thực sự có PO; lỗi thực thi nằm ở tin nhắn.
+      await tg.answerCallback(cb.id, out.po ? 'Đã duyệt ✅' : (decision === 'APPROVED' ? 'Đã ghi quyết định' : 'Đã từ chối')).catch(() => null);
       if (cb.message?.chat?.id) {
         await tg.sendMessage(cb.message.chat.id, out.message).catch((e) => logger.warn(`[chatops] reply callback thất bại: ${e.message}`));
       }
@@ -119,17 +167,45 @@ router.post('/telegram/webhook', express.json({ limit: '100kb' }), async (req, r
     const text = String(msg.text || '').trim();
 
     // /bind OTP (chưa cần binding trước).
+    // CHỐNG DÒ: tra cứu theo HASH, chỉ dòng chưa bind, đếm lần sai rồi khoá.
     if (text.startsWith('/bind')) {
       const otp = text.replace('/bind', '').trim();
       const row = prisma.chatBinding
-        ? await prisma.chatBinding.findFirst({ where: { provider: 'TELEGRAM', otpCode: otp } }).catch(() => null)
+        ? await prisma.chatBinding.findFirst({
+          where: { provider: 'TELEGRAM', otpCode: otpHash(otp), isActive: false },
+        }).catch(() => null)
         : null;
-      if (!row || !row.otpExpiresAt || new Date(row.otpExpiresAt) < new Date()) {
-        await tg.sendMessage(chatId, 'Mã OTP không đúng hoặc đã hết hạn. Mở app ERP → lấy mã mới.').catch(() => null);
+      const locked = row?.otpLockedUntil && new Date(row.otpLockedUntil) > new Date();
+      const expired = !row?.otpExpiresAt || new Date(row.otpExpiresAt) < new Date();
+
+      if (!row || expired || locked) {
+        if (row && !locked && !expired) {
+          // Đoán sai trong lúc mã còn hiệu lực → tăng bộ đếm, vượt ngưỡng thì khoá.
+          const attempts = Number(row.otpAttempts || 0) + 1;
+          await prisma.chatBinding.update({
+            where: { id: row.id },
+            data: attempts >= OTP_MAX_ATTEMPTS
+              ? { otpAttempts: attempts, otpLockedUntil: new Date(Date.now() + 15 * 60 * 1000), otpCode: null }
+              : { otpAttempts: attempts },
+          }).catch(() => null);
+          logger.warn(`[chatops] OTP sai lần ${attempts} cho binding ${row.id}`);
+        }
+        await tg.sendMessage(
+          chatId,
+          locked
+            ? 'Bạn đã đoán sai quá nhiều lần. Mã bị khoá 15 phút — mở app lấy mã mới sau.'
+            : 'Mã OTP không đúng hoặc đã hết hạn. Mở app ERP → lấy mã mới.',
+        ).catch(() => null);
         return res.json({ success: true });
       }
       await runWithTenant(row.tenantId, async () => {
-        await prisma.chatBinding.update({ where: { id: row.id }, data: { externalUserId: fromId, chatId, otpCode: null, otpExpiresAt: null, isActive: true } });
+        await prisma.chatBinding.update({
+          where: { id: row.id },
+          data: {
+            externalUserId: fromId, chatId, otpCode: null, otpExpiresAt: null,
+            otpAttempts: 0, otpLockedUntil: null, isActive: true,
+          },
+        });
       });
       await tg.sendMessage(chatId, '✅ Đã buộc tài khoản ERP. Từ giờ bạn giao việc ở đây, duyệt chi bằng nút Duyệt/Từ chối.').catch(() => null);
       return res.json({ success: true, data: { bound: true } });
@@ -189,13 +265,17 @@ const decideGateAs = async (userId, gateId, decision, note) => {
   if (claimed.count !== 1) throw { status: 409, message: 'Gate đã được xử lý bởi người khác' };
 
   let po = null;
+  let execError = null;
   if (decision === 'APPROVED' && gate.actionType === PO_PROPOSAL) {
     try {
       const { executeGate } = require('../ai/agent.gate.exec');
       const r = await executeGate(gateId, userId, {});
       po = r.po;
     } catch (e) {
-      logger.error(`[chatops] executeGate sau duyệt Telegram thất bại gate=${gateId}: ${e.message}`);
+      // KHÔNG được báo thành công khi PO không tạo được: gate đã APPROVED nhưng
+      // `resultRef` null ⇒ trạng thái "lơ lửng", người duyệt tưởng đã có PO.
+      execError = e;
+      logger.error(`[chatops] executeGate sau duyệt Telegram THẤT BẠI gate=${gateId}: ${e.message}`);
     }
   }
   // Audit bắt buộc (Phase 5) — lỗi audit không làm hỏng response nhưng phải log.
@@ -204,7 +284,7 @@ const decideGateAs = async (userId, gateId, decision, note) => {
       data: {
         userId, action: decision === 'APPROVED' ? 'APPROVE_HUMAN_GATE' : 'REJECT_HUMAN_GATE',
         entity: 'AgentHumanGate', entityId: gateId,
-        afterJson: { decision, note: note || null },
+        afterJson: { decision, note: note || null, poId: po?.id || null, execError: execError?.message || null },
         agentSessionId: gate.sessionId,
         meta: { channel: 'TELEGRAM' },
       },
@@ -212,9 +292,16 @@ const decideGateAs = async (userId, gateId, decision, note) => {
   } catch (e) { logger.error(`[chatops] MẤT audit decide gate ${gateId}: ${e.message}`); }
 
   const message = decision === 'APPROVED'
-    ? (po ? `Đã phê duyệt — tạo PO ${po.poCode}` : 'Đã phê duyệt ✅')
+    ? (po
+      ? `Đã phê duyệt — tạo PO ${po.poCode}`
+      : `⚠️ Đã ghi quyết định duyệt nhưng KHÔNG tạo được PO: ${execError?.message || 'không rõ'}. Dùng POST /api/agent/human-gates/:id/retry-execution để thử lại.`)
     : 'Đã từ chối (đã ghi lý do)';
-  return { gateId, decision, po: po ? { id: po.id, poCode: po.poCode } : null, message };
+  return {
+    gateId, decision,
+    po: po ? { id: po.id, poCode: po.poCode } : null,
+    execError: execError ? { message: execError.message, status: execError.status || null } : null,
+    message,
+  };
 };
 
 /**
@@ -222,6 +309,7 @@ const decideGateAs = async (userId, gateId, decision, note) => {
  * /api/chatops/agents:
  *   get:
  *     summary: Danh sách 6 agent phòng ban + tool whitelist
+ *     description: "Người không thuộc phòng nào được xem tất cả; thuộc phòng thì chỉ thấy agent của phòng mình."
  *     tags: [ChatOps]
  *     security: [{ bearerAuth: [] }]
  *     responses:
@@ -229,8 +317,14 @@ const decideGateAs = async (userId, gateId, decision, note) => {
  */
 router.get('/agents', authenticate, requireModule('ai'), async (req, res, next) => {
   try {
-    const { listAgents } = require('./dept');
-    success(res, listAgents());
+    const { listAgents, AGENTS } = require('./dept');
+    const { getUserDeptCode } = require('../../middleware/dept.middleware');
+    const prisma = require('../../config/prisma');
+    const code = await getUserDeptCode(prisma, req.user).catch(() => null);
+    // Dùng thật lớp phân quyền phòng ban: CASHIER phòng Kế toán không nên thấy
+    // agent Vận hành (agent đó có tool đặt hàng).
+    const agents = code ? listAgents().filter((a) => a.code === code) : listAgents();
+    success(res, agents);
   } catch (e) { next(e); }
 });
 

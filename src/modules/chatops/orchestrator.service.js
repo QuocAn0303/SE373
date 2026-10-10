@@ -8,6 +8,7 @@
  * - Không gọi thẳng config/llm khi tắt: qua llm-policy (callTask) để có đường lui.
  */
 const logger = require('../../utils/logger');
+const crypto = require('crypto');
 const { getAgent, listAgents } = require('./dept');
 const { buildDataRequestGate, buildPoProposalGate, createGate } = require('../ai/agent.humangate');
 
@@ -45,6 +46,9 @@ const TOOL_KEYWORDS = [
   { tool: 'search_production', dept: 'OPS', keys: ['sản xuất', 'lệnh sx'] },
 ];
 
+// Trần số tool call mỗi lượt. Hiện luồng chỉ gọi MỘT tool (điều phối 1 ý định
+// → 1 tool), nên hằng này là CHIẀM BAO vòng lặp thay vì chặn thật — giữ để
+// chặn sai sót khi ai đó thêm tool call trong vòng lặp. Xem `toolCallCount`.
 const MAX_TOOL_CALLS = 4;
 
 const norm = (s) => String(s || '').toLowerCase();
@@ -136,6 +140,68 @@ const memoryBlock = (memories) => {
 };
 
 /**
+ * Resolve product/vendor THẬT cho đề xuất PO từ câu chat.
+ * Câu chat không có SKU/NCC rõ ràng thì trả {ok:false} để orchestrator chuyển sang
+ * gate hỏi lại, thay vì dựng gate PO không thể thực thi được.
+ */
+const resolvePoEntities = async (text) => {
+  const prisma = require('../../config/prisma');
+  const t = String(text || '');
+  const qtyMatch = t.match(/(\d+)\s*(cái|chiếc|hộp|kg|thùng|túi)/i);
+  const quantity = qtyMatch ? Number(qtyMatch[1]) : 1;
+  const { parseAmount } = require('../../utils/vietnameseAmount');
+  const amount = parseAmount(t);
+
+  // TÁCH TÊN NCC TRƯỚC. Nếu không, tên "sáp treo từ NCC An Khang" bị dùng làm
+  // điều kiện tìm Product và không sản phẩm nào khớp ⇒ mọi đề xuất PO rơi
+  // về nhánh hỏi lại, dù dữ liệu có đầy đủ.
+  const vendorPhrase = t.match(/(?:từ|ở|ncc|nhà cung cấp)\s+(.+?)(?:\s+\d+\s|\s*$)/i);
+  const vendorName = vendorPhrase ? vendorPhrase[1].trim() : '';
+
+  let rest = t
+    .replace(/tạo po|tạo đơn nhập|đặt hàng nhập|nhập thêm/gi, ' ')
+    .replace(/(?:từ|ở|ncc|nhà cung cấp)\s+.+$/i, ' ')
+    .replace(/\d+\s*(cái|chiếc|hộp|kg|thùng|túi)/gi, ' ')
+    .replace(/(triệu|nghìn|tỷ|ng|đồng|tr|k)\b/gi, ' ')
+    .replace(/\d+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (rest.length < 2) {
+    return { ok: false, missing: ['productName'] };
+  }
+  const product = await prisma.product.findFirst({
+    where: { isActive: true, name: { contains: rest.slice(0, 60), mode: 'insensitive' } },
+    select: { id: true, name: true, sku: true, costPrice: true, price: true },
+    orderBy: { createdAt: 'desc' },
+  }).catch(() => null);
+  if (!product) return { ok: false, missing: ['product'] };
+
+  if (!vendorName) return { ok: false, missing: ['vendorName'] };
+  const vendor = await prisma.vendor.findFirst({
+    where: { isActive: true, name: { contains: vendorName.slice(0, 60), mode: 'insensitive' } },
+    select: { id: true, name: true },
+    orderBy: { createdAt: 'desc' },
+  }).catch(() => null);
+  // Không tìm thấy NCC trong câu chat ⇒ executor không có vendorId hợp lệ để
+  // revalidate, nên hỏi lại thay vì dựng gate chắc chắn không thực thi được.
+  if (!vendor) return { ok: false, missing: ['vendor'] };
+
+  const unitCost = Number(product.costPrice || amount?.value || 0);
+  if (!unitCost) return { ok: false, missing: ['unitCost'] };
+
+  return {
+    ok: true,
+    items: [{
+      productId: product.id, sku: product.sku, productName: product.name,
+      vendorId: vendor.id, vendorName: vendor.name,
+      quantity, unitCost, totalEstimate: quantity * unitCost,
+    }],
+  };
+};
+
+/**
  * Xử lý 1 tin nhắn chat (dùng chung cho Telegram webhook + API).
  * Trả về { reply, dept, tool, sessionId, gateId, citations }.
  */
@@ -175,6 +241,7 @@ const processMessage = async ({ text, user, chatId = null, updateId = null } = {
     },
   });
   const steps = [];
+  let toolCallCount = 0;
   const pushStep = async (seq, data) => {
     steps.push(data);
     try {
@@ -183,8 +250,7 @@ const processMessage = async ({ text, user, chatId = null, updateId = null } = {
   };
   await pushStep(1, { type: 'LLM_CALL', toolName: null, toolInput: { text, deptHint: kwDept }, toolOutput: { plan: llmPlan || kwTool }, path: llmPlan?.viaLLM ? 'orchestrator_llm' : 'orchestrator_keyword', durationMs: Date.now() - started });
 
-  const agent = require('./dept')[deptCode] || require('./dept').getAgent(deptCode);
-  const resolved = (agent && agent.handle) ? agent : require('./dept').getAgent('SALES');
+  const resolved = getAgent(deptCode) || getAgent('SALES');
   const memories = await recallMemories(prisma, user.tenantId, deptCode);
   const memNote = memoryBlock(memories);
 
@@ -211,14 +277,26 @@ const processMessage = async ({ text, user, chatId = null, updateId = null } = {
       await pushStep(2, { type: 'TOOL_CALL', toolName: 'clarify', toolInput: { text }, toolOutput: { reply }, path: 'clarify', durationMs: 0 });
     } else if ((resolved.writeTools || []).includes(tool)) {
       // WRITE/SPEND → gate PENDING, không thực hiện. Chi tiền không bao giờ auto.
-      const gatePayload = tool === 'create_po'
-        ? buildPoProposalGate({
-            sessionId: session.id, productId: 'CHATOPS', sku: 'CHATOPS', productName: String(text).slice(0, 120),
-            vendorId: 'CHATOPS', vendorName: '', quantity: 1, unitCost: 0, totalEstimate: 0,
-            proposalKey: `CHATOPS:${session.id}`, fingerprint: `chatops-${session.id}`,
-            rationale: { source: 'telegram_chat', text: String(text).slice(0, 500) },
-          })
-        : buildDataRequestGate({ sessionId: session.id, tool, params: { text }, role: user.role, requestedById: user.id });
+      //
+      // KHÔNG ĐƯỢC BỊA PAYLOAD PO. `buildPoProposalGate` cần productId/vendorId THẬT
+      // vì `agent.gate.exec` revalidate sẽ tra NCC/SKUs và từ chối nếu không tồn
+      // tại — payload `productId:'CHATOPS'` khiến mọi lần duyệt PO đều 400 trong
+      // im lặng và người duyệt bị báo "thành công" dù không có PO nào.
+      let gatePayload;
+      if (tool === 'create_po') {
+        const resolvedPo = await resolvePoEntities(text);
+        gatePayload = resolvedPo.ok
+          ? buildPoProposalGate({ sessionId: session.id, ...resolvedPo.items[0] })
+          : buildDataRequestGate({
+            sessionId: session.id,
+            tool: 'create_po_needs_clarification',
+            params: { text, missing: resolvedPo.missing },
+            role: user.role,
+            requestedById: user.id,
+          });
+      } else {
+        gatePayload = buildDataRequestGate({ sessionId: session.id, tool, params: { text }, role: user.role, requestedById: user.id });
+      }
       let gate;
       try {
         gate = await createGate(gatePayload);
@@ -259,17 +337,28 @@ const processMessage = async ({ text, user, chatId = null, updateId = null } = {
         return { reply, dept: deptCode, tool, sessionId: session.id, gateId: gate.id, citations };
       }
     } else {
-      // Read tool (≤ MAX_TOOL_CALLS).
+      // Read tool (≤ MAX_TOOL_CALLS thật sự, không phải chỉ trong comment).
+      toolCallCount += 1;
+      if (toolCallCount > MAX_TOOL_CALLS) {
+        reply = 'Câu này cần quá nhiều bước tra cứu trong một lượt. Bạn hỏi riêng từng phần nhé.';
+        await pushStep(2, { type: 'TOOL_CALL', toolName: 'budget_exceeded', toolInput: { text, toolCallCount }, toolOutput: {}, path: 'tool_budget', durationMs: 0 });
+      } else {
       try {
         const out = await resolved.handle(tool, { search: text, query: text }, { userId: user.id, sessionId: session.id });
         const summary = out?.message || out?.summary || (typeof out === 'string' ? out : JSON.stringify(out).slice(0, 1500));
         reply = `${summary}${memNote}`;
         await pushStep(2, { type: 'TOOL_CALL', toolName: tool, toolInput: { text }, toolOutput: { summary: String(summary).slice(0, 2000) }, path: 'dept_tool', durationMs: Date.now() - started });
       } catch (e) {
+        // KHÔNG lộ lỗi hệ thống (Prisma/SQL) cho người dùng Telegram. Chỉ log id
+        // tra cứu rồi trả câu chung — chi tiết kỹ thuật có thể chứa tên bảng,
+        // tên cột và đoạn truy vấn.
+        const errId = crypto.randomBytes(4).toString('hex');
+        logger.error(`[orchestrator] tool ${tool} lỗi (ref=${errId}): ${e.message}`);
         reply = e.status === 403
           ? 'Xin lỗi, phòng của bạn không có quyền xem thông tin này. Mình đã ghi nhận để quản lý xem xét.'
-          : `Mình chưa tra được (${e.message}). Bạn thử cách hỏi khác nhé.`;
-        await pushStep(2, { type: 'TOOL_CALL', toolName: tool, toolInput: { text }, toolOutput: { error: e.message }, path: 'dept_tool_error', durationMs: 0 });
+          : `Mình chưa tra được dữ liệu lúc này. Mã lỗi: ${errId} (nhờ quản lý tra log).`;
+        await pushStep(2, { type: 'TOOL_CALL', toolName: tool, toolInput: { text }, toolOutput: { ref: errId }, path: 'dept_tool_error', durationMs: 0 });
+      }
       }
     }
   }

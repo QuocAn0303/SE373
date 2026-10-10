@@ -36,12 +36,43 @@ const proposeCandidates = async ({ messages, deptCode, sessionId } = {}) => {
   }
 };
 
-/** Tạo fact PENDING (+ gate duyệt nếu scope COMPANY). */
-const saveCandidate = async ({ key, fact, scope = 'COMPANY', departmentId = null, sessionId = null, createdById = null } = {}) => {
+/**
+ * Tạo fact ứng viên.
+ *
+ * - scope COMPANY → status PENDING + gate duyệt (ADMIN/MANAGER mới nạp được).
+ * - scope DEPT → ACTIVE ngay, NHƯNG chỉ MANAGER/ADMIN được tạo, và `departmentId`
+ *   phải là phòng của chính người tạo (nếu không, user phòng A ghi được fact vào
+ *   phòng B và fact đó lọt vào system prompt của phòng B).
+ */
+const saveCandidate = async ({ key, fact, scope = 'COMPANY', departmentId = null, sessionId = null, createdById = null, user = null } = {}) => {
   const prisma = require('../../config/prisma');
   if (!prisma.agentMemory) throw { status: 503, message: 'AgentMemory chưa có trong Prisma client — chạy `npx prisma generate` + migrate hermes' };
+
+  const isManager = Boolean(user && ['ADMIN', 'MANAGER', 'SUPER_ADMIN', 'SUPER_OMEGA_ULTRA_ADMIN'].includes(user.role));
+  if (scope === 'DEPT' && !isManager) {
+    throw { status: 403, message: 'Chỉ MANAGER/ADMIN được ghi fact cấp phòng ban' };
+  }
+
+  let deptId = departmentId;
+  if (scope === 'DEPT') {
+    if (!deptId && user?.deptCode) {
+      const d = await prisma.department.findFirst({ where: { code: user.deptCode }, select: { id: true } }).catch(() => null);
+      deptId = d?.id || null;
+    }
+    // MANAGER chỉ được ghi vào phòng mình; ADMIN/SUPER_* được ghi phòng bất kỳ.
+    const ownDept = await prisma.department.findFirst({
+      where: user?.deptCode ? { code: user.deptCode } : { id: '__none__' },
+      select: { id: true },
+    }).catch(() => null);
+    if (user?.role === 'MANAGER' && ownDept && deptId && deptId !== ownDept.id) {
+      throw { status: 403, message: 'MANAGER chỉ được ghi fact cho phòng của mình' };
+    }
+  } else {
+    deptId = null; // COMPANY không gắn phòng
+  }
+
   const mem = await prisma.agentMemory.create({
-    data: { scope, departmentId, key, fact, sourceSessionId: sessionId, status: 'PENDING', createdById },
+    data: { scope, departmentId: deptId, key, fact, sourceSessionId: sessionId, status: 'PENDING', createdById },
   });
   let gateId = null;
   if (scope === 'COMPANY') {
